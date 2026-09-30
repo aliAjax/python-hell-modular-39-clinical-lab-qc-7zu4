@@ -194,6 +194,35 @@ def _validate_correct(actor, entity, data, lookup):
     return {"correction_history": history}
 
 
+def _validate_external_report(actor, data, lookup):
+    assay = _find_one(lookup, "assay", "id", data.get("assay_id"))
+    instrument = _find_one(lookup, "instrument", "id", data.get("instrument_id"))
+    if not assay or not instrument:
+        raise ValidationError("assay and instrument are required")
+    if not str(data.get("batch_no", "")).strip():
+        raise ValidationError("batch_no is required")
+    try:
+        reported = float(data.get("reported_value"))
+    except (TypeError, ValueError):
+        raise ValidationError("reported_value must be numeric")
+    report_key = "%s:%s:%s" % (data["assay_id"], data["instrument_id"], data["batch_no"])
+    return {"report_key": report_key, "reported_value": reported}
+
+
+def _validate_reconciliation(actor, data, lookup):
+    report = _find_one(lookup, "external_report", "id", data.get("report_id"))
+    if not report:
+        raise ValidationError("external report does not exist")
+    return {}
+
+
+def _validate_deviation_exception(actor, data, lookup):
+    report = _find_one(lookup, "external_report", "id", data.get("report_id"))
+    if not report:
+        raise ValidationError("external report does not exist")
+    return {}
+
+
 class RuleEngine:
     ALIASES = {
         "assays": "assay",
@@ -201,6 +230,11 @@ class RuleEngine:
         "instruments": "instrument",
         "qc_runs": "qc_run",
         "result_batches": "result_batch",
+        "external_reports": "external_report",
+        "reports": "external_report",
+        "reconciliations": "reconciliation",
+        "exceptions": "deviation_exception",
+        "deviation_exceptions": "deviation_exception",
     }
     INITIAL_STATUS = {
         "assay": "active",
@@ -208,7 +242,12 @@ class RuleEngine:
         "instrument": "ready",
         "qc_run": "pending",
         "result_batch": "waiting",
+        "external_report": "imported",
+        "reconciliation": "pending",
+        "deviation_exception": "pending",
     }
+    # Kinds that are produced by the system, never created directly through the API.
+    INTERNAL_KINDS = ("reconciliation", "deviation_exception")
     TRANSITIONS = {
         "assay": {
             "suspend": (("active",), "suspended"),
@@ -236,10 +275,25 @@ class RuleEngine:
         "result_batch": {
             "release": (("waiting",), "released"),
             "intercept": (("waiting",), "intercepted"),
+            "freeze": (("waiting",), "frozen"),
+            "unfreeze": (("frozen",), "waiting"),
             "retest": (("intercepted",), "waiting"),
             "investigate": (("intercepted",), "investigating"),
             "resolve": (("investigating",), "resolved"),
             "correct": (("waiting", "intercepted", "investigating", "released", "resolved"), "waiting"),
+        },
+        "external_report": {
+            # Outcome (reconciled / deviation / failed) is decided by reconciliation.
+            "reconcile": (("imported", "failed"), "reconciled"),
+        },
+        "reconciliation": {
+            # Retry is only allowed after a failed reconciliation.
+            "retry": (("failed",), "matched"),
+        },
+        "deviation_exception": {
+            # Two distinct people must confirm before release.
+            "confirm": (("pending",), "confirmed"),
+            "release": (("confirmed",), "released"),
         },
     }
     CREATE_REQUIRED = {
@@ -248,6 +302,9 @@ class RuleEngine:
         "instrument": ("name", "serial", "calibration_due"),
         "qc_run": ("assay_id", "qc_lot_id", "instrument_id", "value", "run_at"),
         "result_batch": ("assay_id", "instrument_id", "qc_run_id", "run_at", "patient_count"),
+        "external_report": ("assay_id", "instrument_id", "batch_no", "reported_value", "reported_at"),
+        "reconciliation": (),
+        "deviation_exception": (),
     }
     ACTION_REQUIRED = {
         ("assay", "suspend"): ("reason",),
@@ -268,6 +325,10 @@ class RuleEngine:
         ("result_batch", "investigate"): ("reason",),
         ("result_batch", "resolve"): ("resolution",),
         ("result_batch", "correct"): ("reason",),
+        ("external_report", "reconcile"): (),
+        ("reconciliation", "retry"): (),
+        ("deviation_exception", "confirm"): (),
+        ("deviation_exception", "release"): (),
     }
     CREATE_ROLES = {
         "assay": ("supervisor", "admin"),
@@ -275,6 +336,9 @@ class RuleEngine:
         "instrument": ("supervisor", "admin"),
         "qc_run": ("operator", "supervisor", "admin"),
         "result_batch": ("operator", "supervisor", "admin"),
+        "external_report": ("operator", "supervisor", "admin"),
+        "reconciliation": (),
+        "deviation_exception": (),
     }
     ROLE_ACTIONS = {
         "suspend": ("supervisor", "admin"),
@@ -292,6 +356,11 @@ class RuleEngine:
         "correct": ("supervisor", "admin"),
         "release": ("supervisor", "admin"),
         "intercept": ("operator", "supervisor", "admin"),
+        "freeze": ("operator", "supervisor", "admin"),
+        "unfreeze": ("operator", "supervisor", "admin"),
+        "reconcile": ("operator", "supervisor", "admin"),
+        "retry": ("operator", "supervisor", "admin"),
+        "confirm": ("supervisor", "analyst"),
     }
     CUSTOM_CREATE = {
         "assay": _validate_assay,
@@ -299,6 +368,9 @@ class RuleEngine:
         "instrument": _validate_instrument,
         "qc_run": _validate_qc_run,
         "result_batch": _validate_result_batch,
+        "external_report": _validate_external_report,
+        "reconciliation": _validate_reconciliation,
+        "deviation_exception": _validate_deviation_exception,
     }
     CUSTOM_TRANSITIONS = {
         ("qc_run", "evaluate"): _validate_evaluate,
@@ -323,6 +395,11 @@ class RuleEngine:
         if actor.role not in allowed:
             raise PermissionDenied("role %s is not allowed here" % actor.role)
 
+    def check_role(self, actor, kind, action):
+        kind = self.normalize_kind(kind)
+        allowed = self.ROLE_ACTIONS.get((kind, action), self.ROLE_ACTIONS.get(action, ("admin",)))
+        self._ensure_role(actor, allowed)
+
     @staticmethod
     def _require(data, fields):
         for field in fields:
@@ -334,6 +411,8 @@ class RuleEngine:
         kind = self.normalize_kind(kind)
         if kind not in self.INITIAL_STATUS:
             raise ValidationError("unknown kind: " + str(kind))
+        if kind in self.INTERNAL_KINDS:
+            raise ValidationError("%s is managed by the reconciliation workflow" % kind)
         self._ensure_role(actor, self.CREATE_ROLES.get(kind, ("admin",)))
         self._require(data, self.CREATE_REQUIRED.get(kind, ()))
         custom = self.CUSTOM_CREATE.get(kind)

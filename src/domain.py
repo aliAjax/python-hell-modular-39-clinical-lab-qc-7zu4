@@ -23,6 +23,19 @@ class ConflictError(DomainError):
     """A uniqueness or version constraint was violated."""
 
 
+class ConcurrentModification(ConflictError):
+    """An optimistic lock lost, or a business-rule conflict was detected.
+
+    Carries the latest known state of the entity and a list of concrete
+    conflict items so the caller can reconcile and retry.
+    """
+
+    def __init__(self, message, latest=None, conflicts=None):
+        super().__init__(message)
+        self.latest = latest
+        self.conflicts = list(conflicts or [])
+
+
 class InvalidTransition(DomainError):
     """The requested state transition is not valid."""
 

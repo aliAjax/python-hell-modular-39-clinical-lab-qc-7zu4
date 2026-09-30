@@ -14,13 +14,16 @@
 <body>
 <main>
   <h1>临床实验室质量控制与结果拦截</h1>
-  <p>质控规则、仪器校准、失控调查和患者结果批次通过JSON接口管理。</p>
+  <p>质控规则、仪器校准、失控调查、患者结果批次与外部回报对账通过JSON接口管理。</p>
   <p><button onclick="checkHealth()">检查服务状态</button></p>
   <pre id="result">等待操作</pre>
   <pre>GET  /health
 GET  /api/&lt;kind&gt;
-POST /api/&lt;kind&gt;
+POST /api/&lt;kind&gt;            (assays, qc_lots, instruments, qc_runs, result_batches, external_reports)
 POST /api/entities/&lt;id&gt;/actions
+    external_report: reconcile
+    reconciliation:  retry
+    deviation_exception: confirm, release
 GET  /api/audit</pre>
 </main>
 <script>

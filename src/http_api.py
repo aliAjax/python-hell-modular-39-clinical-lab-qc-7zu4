@@ -5,6 +5,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .domain import (
     Actor,
+    ConcurrentModification,
     ConflictError,
     DomainError,
     InvalidTransition,
@@ -62,6 +63,15 @@ def create_handler(service, rules, static_dir):
                 status = 403
             elif isinstance(exc, NotFoundError):
                 status = 404
+            elif isinstance(exc, ConcurrentModification):
+                payload = {
+                    "error": str(exc),
+                    "type": type(exc).__name__,
+                    "conflicts": exc.conflicts,
+                }
+                if exc.latest is not None:
+                    payload["latest"] = exc.latest
+                return self._send(409, payload)
             elif isinstance(exc, (ConflictError, InvalidTransition)):
                 status = 409
             elif isinstance(exc, ValidationError):
