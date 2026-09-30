@@ -12,6 +12,40 @@ def calibration_is_valid(calibration_due, as_of):
     return str(calibration_due)[:10] >= str(as_of)[:10]
 
 
+def reconciliation_deviation(external_value, local_value, limit=None, limit_source="unconfigured"):
+    """Compare an external reported value with the local patient-batch reference value.
+
+    Absolute deviation is compared against a pre-resolved ``limit``. The caller resolves
+    the limit from the assay-level ``reconcile_abs_limit`` or a QC-SD multiple. A limit
+    that is missing or not positive means the comparison cannot be evaluated.
+    """
+    try:
+        external_value = float(external_value)
+        local_value = float(local_value)
+    except (TypeError, ValueError):
+        raise ValidationError("external and local values must be numeric")
+    deviation = round(external_value - local_value, 6)
+    try:
+        limit = float(limit) if limit is not None else None
+    except (TypeError, ValueError):
+        limit = None
+    if limit is None or limit <= 0:
+        return {
+            "deviation": deviation,
+            "abs_deviation": round(abs(deviation), 6),
+            "limit": None,
+            "within_limit": None,
+            "limit_source": "unconfigured",
+        }
+    return {
+        "deviation": deviation,
+        "abs_deviation": round(abs(deviation), 6),
+        "limit": round(limit, 6),
+        "within_limit": abs(deviation) <= limit,
+        "limit_source": limit_source,
+    }
+
+
 def evaluate_qc(history, value, target, sd, config=None):
     """Evaluate one QC value against numeric and multi-rule criteria."""
     config = dict(config or {})
@@ -70,9 +104,19 @@ def _validate_assay(actor, data, lookup):
         raise ValidationError("allowed_low and allowed_high must be numeric")
     if low >= high:
         raise ValidationError("allowed_low must be less than allowed_high")
-    return {
+    result = {
         "rule_config": dict(data.get("rule_config") or {}),
     }
+    abs_limit = data.get("reconcile_abs_limit")
+    if abs_limit is not None:
+        try:
+            abs_limit = float(abs_limit)
+        except (TypeError, ValueError):
+            raise ValidationError("reconcile_abs_limit must be numeric")
+        if abs_limit <= 0:
+            raise ValidationError("reconcile_abs_limit must be positive")
+        result["reconcile_abs_limit"] = abs_limit
+    return result
 
 
 def _validate_qc_lot(actor, data, lookup):
@@ -201,6 +245,9 @@ class RuleEngine:
         "instruments": "instrument",
         "qc_runs": "qc_run",
         "result_batches": "result_batch",
+        "external_reports": "external_report",
+        "reconciliations": "reconciliation",
+        "review_exceptions": "review_exception",
     }
     INITIAL_STATUS = {
         "assay": "active",
@@ -236,10 +283,14 @@ class RuleEngine:
         "result_batch": {
             "release": (("waiting",), "released"),
             "intercept": (("waiting",), "intercepted"),
+            "freeze": (("waiting",), "frozen"),
             "retest": (("intercepted",), "waiting"),
             "investigate": (("intercepted",), "investigating"),
             "resolve": (("investigating",), "resolved"),
             "correct": (("waiting", "intercepted", "investigating", "released", "resolved"), "waiting"),
+        },
+        "external_report": {
+            "reconcile": (("received", "reconciled"), "reconciled"),
         },
     }
     CREATE_REQUIRED = {
@@ -264,6 +315,7 @@ class RuleEngine:
         ("qc_run", "correct"): ("reason", "value"),
         ("result_batch", "release"): ("reviewer_id",),
         ("result_batch", "intercept"): ("reason",),
+        ("result_batch", "freeze"): ("reason", "exception_id"),
         ("result_batch", "retest"): ("replacement_run_id", "reason"),
         ("result_batch", "investigate"): ("reason",),
         ("result_batch", "resolve"): ("resolution",),
@@ -292,6 +344,7 @@ class RuleEngine:
         "correct": ("supervisor", "admin"),
         "release": ("supervisor", "admin"),
         "intercept": ("operator", "supervisor", "admin"),
+        "freeze": ("operator", "supervisor", "admin"),
     }
     CUSTOM_CREATE = {
         "assay": _validate_assay,

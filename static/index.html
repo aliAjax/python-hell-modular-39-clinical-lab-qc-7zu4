@@ -18,9 +18,12 @@
   <p><button onclick="checkHealth()">检查服务状态</button></p>
   <pre id="result">等待操作</pre>
   <pre>GET  /health
-GET  /api/&lt;kind&gt;
+GET  /api/&lt;kind&gt;  (external_reports / reconciliations / review_exceptions)
 POST /api/&lt;kind&gt;
 POST /api/entities/&lt;id&gt;/actions
+POST /api/external_reports/import
+POST /api/external_reports/&lt;id&gt;/reconcile
+POST /api/review_exceptions/&lt;id&gt;/confirm|resolve|release
 GET  /api/audit</pre>
 </main>
 <script>

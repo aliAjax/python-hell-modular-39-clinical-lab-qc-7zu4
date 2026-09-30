@@ -27,6 +27,15 @@ class InvalidTransition(DomainError):
     """The requested state transition is not valid."""
 
 
+class ReconciliationConflict(DomainError):
+    """A reconciliation action lost a race; the caller must reconcile with the latest conclusion."""
+
+    def __init__(self, message, latest=None, conflicts=None):
+        super().__init__(message)
+        self.latest = latest or {}
+        self.conflicts = conflicts or []
+
+
 class Role(str, Enum):
     viewer = "viewer"
     reporter = "reporter"

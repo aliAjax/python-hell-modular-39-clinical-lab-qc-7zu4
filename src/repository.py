@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from .domain import ConflictError, NotFoundError
@@ -54,7 +55,26 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS external_report_imports (
+                    report_key TEXT PRIMARY KEY,
+                    report_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
             """)
+
+    @contextmanager
+    def transaction(self):
+        """Open one serialised transaction so multi-step use cases are atomic and retryable."""
+        connection = self._connect()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     @staticmethod
     def _entity_from_row(row):
@@ -195,6 +215,103 @@ class SQLiteRepository:
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
             )
+
+    @staticmethod
+    def conn_get_entity(connection, entity_id):
+        row = connection.execute(
+            "SELECT * FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
+        return SQLiteRepository._entity_from_row(row) if row else None
+
+    @staticmethod
+    def conn_list_entities(connection, kind=None, status=None):
+        clauses = []
+        params = []
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = connection.execute(
+            "SELECT * FROM entities" + where + " ORDER BY created_at, id", params
+        ).fetchall()
+        return [SQLiteRepository._entity_from_row(row) for row in rows]
+
+    @staticmethod
+    def conn_find_entities(connection, kind, field, value):
+        return [
+            entity
+            for entity in SQLiteRepository.conn_list_entities(connection, kind=kind)
+            if (entity["id"] == value if field == "id" else entity["data"].get(field) == value)
+        ]
+
+    @staticmethod
+    def conn_insert_entity(connection, entity_id, kind, status, data, actor_id):
+        now = utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        connection.execute(
+            "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+            "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
+            (entity_id, kind, status, payload, actor_id, now, now),
+        )
+        return SQLiteRepository.conn_get_entity(connection, entity_id)
+
+    @staticmethod
+    def conn_update_entity(connection, entity_id, expected_version, status, data):
+        now = utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        row = connection.execute(
+            "SELECT version FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
+        if not row:
+            raise NotFoundError("entity not found: " + entity_id)
+        current_version = int(row["version"])
+        if expected_version is not None and current_version != int(expected_version):
+            raise ConflictError(
+                "version conflict: expected %s, found %s"
+                % (expected_version, current_version)
+            )
+        connection.execute(
+            "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+            "WHERE id = ? AND version = ?",
+            (status, payload, now, entity_id, current_version),
+        )
+        return SQLiteRepository.conn_get_entity(connection, entity_id)
+
+    @staticmethod
+    def conn_append_audit(connection, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
+        connection.execute(
+            "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                entity_id,
+                actor_id,
+                actor_role,
+                action,
+                from_status,
+                to_status,
+                json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                utcnow(),
+            ),
+        )
+
+    @staticmethod
+    def conn_reserve_report_import(connection, report_key, report_id):
+        try:
+            connection.execute(
+                "INSERT INTO external_report_imports(report_key, report_id, created_at) "
+                "VALUES (?, ?, ?)",
+                (report_key, report_id, utcnow()),
+            )
+            return None
+        except sqlite3.IntegrityError:
+            row = connection.execute(
+                "SELECT report_id FROM external_report_imports WHERE report_key = ?",
+                (report_key,),
+            ).fetchone()
+            return row["report_id"] if row else None
 
     def ping(self):
         with self._connect() as connection:

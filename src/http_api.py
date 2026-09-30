@@ -10,6 +10,7 @@ from .domain import (
     InvalidTransition,
     NotFoundError,
     PermissionDenied,
+    ReconciliationConflict,
     ValidationError,
 )
 
@@ -64,13 +65,19 @@ def create_handler(service, rules, static_dir):
                 status = 404
             elif isinstance(exc, (ConflictError, InvalidTransition)):
                 status = 409
+            elif isinstance(exc, ReconciliationConflict):
+                status = 409
             elif isinstance(exc, ValidationError):
                 status = 400
             elif isinstance(exc, DomainError):
                 status = 400
             else:
                 status = 500
-            self._send(status, {"error": str(exc), "type": type(exc).__name__})
+            payload = {"error": str(exc), "type": type(exc).__name__}
+            if isinstance(exc, ReconciliationConflict):
+                payload["latest"] = exc.latest
+                payload["conflicts"] = exc.conflicts
+            self._send(status, payload)
 
         def do_GET(self):
             try:
@@ -93,7 +100,10 @@ def create_handler(service, rules, static_dir):
                         return self._send(200, service.get(parts[2]))
                     query = parse_qs(parsed.query)
                     status = query.get("status", [None])[0]
-                    return self._send(200, {"items": service.list(parts[1], status=status)})
+                    return self._send(
+                        200,
+                        {"items": service.list(rules.normalize_kind(parts[1]), status=status)},
+                    )
                 raise NotFoundError("not found")
             except Exception as exc:
                 self._fail(exc)
@@ -103,6 +113,58 @@ def create_handler(service, rules, static_dir):
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
+                if (
+                    len(parts) == 3
+                    and parts[0] == "api"
+                    and parts[1] == "external_reports"
+                    and parts[2] == "import"
+                ):
+                    return self._send(
+                        201,
+                        service.import_external_report(
+                            actor,
+                            self._body(),
+                            self.headers.get("Idempotency-Key"),
+                        ),
+                    )
+                if (
+                    len(parts) == 4
+                    and parts[0] == "api"
+                    and parts[1] == "external_reports"
+                    and parts[3] == "reconcile"
+                ):
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.reconcile_external_report(
+                            actor,
+                            parts[2],
+                            body.pop("expected_version", None),
+                        ),
+                    )
+                if (
+                    len(parts) == 4
+                    and parts[0] == "api"
+                    and parts[1] == "review_exceptions"
+                    and parts[3] in ("confirm", "resolve", "release")
+                ):
+                    body = self._body()
+                    action = parts[3]
+                    note = body.pop("note", "")
+                    expected_version = body.pop("expected_version", None)
+                    if action == "confirm":
+                        result = service.confirm_review_exception(
+                            actor, parts[2], note, expected_version
+                        )
+                    elif action == "resolve":
+                        result = service.resolve_review_exception(
+                            actor, parts[2], note, expected_version
+                        )
+                    else:
+                        result = service.release_review_exception(
+                            actor, parts[2], note, expected_version
+                        )
+                    return self._send(200, result)
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)

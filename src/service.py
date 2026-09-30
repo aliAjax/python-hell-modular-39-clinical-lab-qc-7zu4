@@ -2,6 +2,7 @@ from uuid import uuid4
 
 from .audit import AuditTrail
 from .domain import ConflictError, NotFoundError
+from .reconciliation import ReconciliationService
 from .rules import RuleEngine
 
 
@@ -10,6 +11,7 @@ class DomainService:
         self.repository = repository
         self.rules = rules or RuleEngine()
         self.audit = AuditTrail(repository)
+        self.reconciliation = ReconciliationService(repository, self.audit)
 
     def _lookup(self, kind, field, value):
         return self.repository.find_entities(self.rules.normalize_kind(kind), field, value)
@@ -73,3 +75,26 @@ class DomainService:
 
     def audit_log(self, entity_id=None):
         return self.repository.list_audit(entity_id=entity_id)
+
+    # ------------------------------------------------- external reconciliation
+
+    def import_external_report(self, actor, payload, idempotency_key=None):
+        return self.reconciliation.import_report(actor, payload, idempotency_key)
+
+    def reconcile_external_report(self, actor, report_id, expected_version=None):
+        return self.reconciliation.reconcile_report(actor, report_id, expected_version)
+
+    def confirm_review_exception(self, actor, exception_id, note="", expected_version=None):
+        return self.reconciliation.confirm_exception(
+            actor, exception_id, note, expected_version
+        )
+
+    def resolve_review_exception(self, actor, exception_id, note="", expected_version=None):
+        return self.reconciliation.resolve_exception(
+            actor, exception_id, note, expected_version
+        )
+
+    def release_review_exception(self, actor, exception_id, note="", expected_version=None):
+        return self.reconciliation.release_exception(
+            actor, exception_id, note, expected_version
+        )
